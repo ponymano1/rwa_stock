@@ -15,6 +15,7 @@ import "./interfaces.sol";
  *         拆分用 ERC-8056 乘数（纯展示），分红用独立累积指数（真实增值）。
  *
  * 不变量（偿付）：totalSupply() * uiMultiplier() / 1e18 <= custodyShares
+ * 不变量（锁定）：locked[user] <= balanceOf(user)
  */
 contract StockRWAToken is
     ERC20,
@@ -30,8 +31,9 @@ contract StockRWAToken is
     using SafeERC20 for IERC20;
 
     /* ───────────── 角色 ───────────── */
-    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE"); // 执行铸销、拆分、分红
-    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE"); // 紧急暂停
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");     // 执行铸销、拆分、分红
+    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");     // 紧急暂停
+    bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE"); // 交易所结算引擎：锁定/解锁/交割
 
     /* ───────────── 常量 ───────────── */
     uint256 private constant MULTIPLIER_ONE = 1e18; // 乘数与指数缩放基准
@@ -55,6 +57,12 @@ contract StockRWAToken is
     mapping(address => uint256) public lastIndex;       // 用户上次结算时的指数
     mapping(address => uint256) public dividendOwed;    // 已结算但未提取的 USDC
 
+    /* ───────────── 锁定层状态（撮合冻结） ───────────── */
+    // locked: 因挂单被交易所冻结、用户自己不可转移的份额；仍留在 balanceOf 内，继续计分红
+    mapping(address => uint256) public locked;
+    // _settling: 仅在结算交割期间为 true，使 _update 跳过"未锁定份额"校验
+    bool private _settling;
+
     /* ───────────── 一级市场订单 ───────────── */
     enum OrderType { MINT, REDEEM }
     enum OrderStatus { PENDING, FILLED, CANCELLED }
@@ -72,6 +80,13 @@ contract StockRWAToken is
     uint256 public orderTimeout = 3 days; // 超时可取消
     mapping(uint256 => Order) public orders;
 
+    /* ───────────── 批量结算入参 ───────────── */
+    struct SettleItem {
+        address from;
+        address to;
+        uint256 amount;
+    }
+
     /* ───────────── 事件 ───────────── */
     event MintRequested(uint256 indexed orderId, address indexed user, uint256 usdcAmount, uint256 minUIOut);
     event MintExecuted(uint256 indexed orderId, address indexed user, uint256 shares, uint256 uiTokens, uint256 fillPrice);
@@ -83,6 +98,10 @@ contract StockRWAToken is
     event ComplianceModuleUpdated(address module);
     event OracleUpdated(address oracle);
     event ReserveOracleUpdated(address oracle);
+    // 锁定层
+    event SharesLocked(address indexed user, uint256 amount, uint256 totalLocked);
+    event SharesUnlocked(address indexed user, uint256 amount, uint256 totalLocked);
+    event SettledTransfer(address indexed from, address indexed to, uint256 amount);
 
     /* ───────────── 构造 ───────────── */
     constructor(
@@ -99,6 +118,8 @@ contract StockRWAToken is
         _grantRole(OPERATOR_ROLE, operator_);
         _grantRole(GUARDIAN_ROLE, guardian_);
         _effectiveAt = block.timestamp; // 初始乘数立即有效
+        // 注意：SETTLEMENT_ROLE 由 admin 在部署后 grantRole 授予交易所结算地址
+        //（建议用独立的热钱包/多签，与 OPERATOR 分离）
     }
 
     /* ════════════════════════════════════════════════════════════════
@@ -153,7 +174,7 @@ contract StockRWAToken is
 
     /* ───────────── ERC-8056 转换/余额扩展 ───────────── */
 
-    /// @dev raw → UI，向下取整（�VarChar向系统安全方向）
+    /// @dev raw → UI，向下取整（向系统安全方向）
     function toUIAmount(uint256 rawAmount) public view override returns (uint256) {
         return (rawAmount * uiMultiplier()) / MULTIPLIER_ONE;
     }
@@ -169,6 +190,89 @@ contract StockRWAToken is
 
     function totalSupplyUI() external view override returns (uint256) {
         return toUIAmount(totalSupply());
+    }
+
+    /* ════════════════════════════════════════════════════════════════
+       锁定层：撮合冻结（份额留在用户余额内，分红/拆分透明）
+       由交易所结算引擎（SETTLEMENT_ROLE）调用
+       ════════════════════════════════════════════════════════════════ */
+
+    /// @notice 用户当前可自由支配（未锁定）的 raw 份额
+    function freeBalanceOf(address account) public view returns (uint256) {
+        return balanceOf(account) - locked[account];
+    }
+
+    /**
+     * @notice 下单时冻结用户份额。份额不离开用户余额，仅标记为不可自转。
+     * @dev    冻结期间该份额继续按真实持有人累积分红、随乘数展示，对企业行动透明。
+     */
+    function lock(address user, uint256 amount)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+        whenNotPaused
+    {
+        require(amount > 0, "amount=0");
+        require(balanceOf(user) - locked[user] >= amount, "INSUFFICIENT_FREE");
+        locked[user] += amount;
+        emit SharesLocked(user, amount, locked[user]);
+    }
+
+    /**
+     * @notice 撤单 / 未成交部分：解除冻结。
+     * @dev    紧急暂停期间也允许解锁，以便释放挂单。
+     */
+    function unlock(address user, uint256 amount)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+    {
+        require(amount > 0, "amount=0");
+        require(locked[user] >= amount, "EXCEEDS_LOCKED");
+        locked[user] -= amount;
+        emit SharesUnlocked(user, amount, locked[user]);
+    }
+
+    /**
+     * @notice 单笔交割：把卖方已锁定份额过户给买方（DvP 的 token 腿）。
+     * @dev    先扣减 locked 再转账，保证 locked <= balance 不变量；
+     *         转账仍走 _update，买方合规（canTransfer）照常校验。
+     *         现金腿（USDC）由交易所在同一结算批次中处理。
+     */
+    function settleTransfer(address from, address to, uint256 amount)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        _settling = true;
+        _settleLockedTransfer(from, to, amount);
+        _settling = false;
+    }
+
+    /**
+     * @notice 批量净额交割：一次结算多笔（链下撮合 → 链上批量结算）。
+     * @dev    传入的应为净额化后的转账清单，省 gas、降低链上次数。
+     */
+    function settleTransferBatch(SettleItem[] calldata items)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        _settling = true;
+        for (uint256 i = 0; i < items.length; i++) {
+            _settleLockedTransfer(items[i].from, items[i].to, items[i].amount);
+        }
+        _settling = false;
+    }
+
+    /// @dev 交割内部逻辑：要求来源份额已被锁定，先减锁再过户。
+    function _settleLockedTransfer(address from, address to, uint256 amount) private {
+        require(amount > 0, "amount=0");
+        require(locked[from] >= amount, "EXCEEDS_LOCKED");
+        // 先扣减锁定额，再过户；此时 _settling=true，_update 跳过未锁定校验
+        locked[from] -= amount;
+        _transfer(from, to, amount);
+        emit SettledTransfer(from, to, amount);
     }
 
     /* ════════════════════════════════════════════════════════════════
@@ -207,6 +311,7 @@ contract StockRWAToken is
         uint256 delta = dividendIndex - lastIndex[user];
         if (delta == 0) return 0;
         // delta 单位：USDC*1e18/份额；balanceOf*delta/1e18 = USDC
+        // 注意：balanceOf 含锁定份额，故冻结中的份额仍计分红给真实持有人
         return (balanceOf(user) * delta) / MULTIPLIER_ONE;
     }
 
@@ -229,14 +334,21 @@ contract StockRWAToken is
     }
 
     /* ════════════════════════════════════════════════════════════════
-       转账钩子：合规校验 + 分红结算 + ERC-8056 事件
-       这是三套机制的交汇点，顺序至关重要。
+       转账钩子：锁定校验 + 合规校验 + 分红结算 + ERC-8056 事件
+       这是各套机制的交汇点，顺序至关重要。
        ════════════════════════════════════════════════════════════════ */
     function _update(address from, address to, uint256 amount)
         internal
         override
         whenNotPaused
     {
+        // 0) 锁定校验：用户自发的任何转出（含 requestRedeem 转入合约）只能动用未锁定份额。
+        //    结算交割通过 _settling=true 跳过此校验（其在调用前已扣减 locked）。
+        //    铸造（from=0）不受限。
+        if (from != address(0) && !_settling) {
+            require(balanceOf(from) - locked[from] >= amount, "EXCEEDS_FREE_BALANCE");
+        }
+
         // 1) 合规：普通转账双向校验；铸造(from=0)校验接收方；销毁(to=0)放行
         if (from != address(0) && to != address(0)) {
             require(address(compliance) == address(0) || compliance.canTransfer(from, to, amount), "COMPLIANCE_FAIL");
@@ -329,6 +441,7 @@ contract StockRWAToken is
      * @notice 用户赎回：锁定 raw 份额，等待运营商卖股回款。
      * @param shareAmount raw 份额
      * @param minUSDCOut  可接受的最小 USDC 回款
+     * @dev    赎回仅能动用未锁定份额（_update 中的锁定校验自动保证）。
      */
     function requestRedeem(uint256 shareAmount, uint256 minUSDCOut)
         external
@@ -337,7 +450,7 @@ contract StockRWAToken is
         returns (uint256 orderId)
     {
         require(shareAmount > 0, "amount=0");
-        // 把份额从用户转入合约托管（触发分红结算），赎回挂起期间不再计分红
+        // 把份额从用户转入合约托管（触发分红结算 + 未锁定份额校验），赎回挂起期间不再计分红
         _transfer(msg.sender, address(this), shareAmount);
 
         orderId = nextOrderId++;
